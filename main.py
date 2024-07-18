@@ -474,10 +474,9 @@ def efficientnet_b7(input_ch=3, num_classes=512):
 class VQAModel(nn.Module):
     def __init__(self, vocab_size: int, n_answer: int):
         super().__init__()
-        # self.resnet = ResNet18()
         self.efficientnet = efficientnet_b0()
-        self.vocab_size = 768
-        self.text_encoder = nn.Linear(self.vocab_size, 512)
+#         vocab_size = 768
+        self.text_encoder = nn.Linear(vocab_size, 512)
 
         self.fc = nn.Sequential(
             nn.Linear(1024, 512),
@@ -489,9 +488,9 @@ class VQAModel(nn.Module):
         image_feature = self.efficientnet(image)  # 画像の特徴量
         question_feature = self.text_encoder(question)  # テキストの特徴量
 
-        # print(image_feature.shape, question_feature.squeeze(1).shape)
+        print(image_feature.shape, question_feature.shape)
 
-        x = torch.cat([image_feature, question_feature.squeeze(1)], dim=1)
+        x = torch.cat([image_feature, question_feature], dim=1)
         x = self.fc(x)
 
         return x
@@ -555,16 +554,16 @@ def main():
     transform = transforms.Compose([
         transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
         # transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5),
-        # transforms.RandomHorizontalFlip(p=1.0),
-        # transforms.RandomRotation(degrees=(-180, 180)),
+#         transforms.RandomHorizontalFlip(p=1.0),
+#         transforms.RandomRotation(degrees=(-180, 180)),
 
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
-        # transforms.RandomErasing(p=0.8, scale=(0.02, 0.33), ratio=(0.3, 3.3)),
+#         transforms.RandomErasing(p=0.8, scale=(0.02, 0.33), ratio=(0.3, 3.3)),
 
     ])
-    train_dataset = VQADataset(df_path="/content/data/train.json", image_dir="/content/data/train", transform=transform)
-    test_dataset = VQADataset(df_path="/content/data/valid.json", image_dir="/content/data/valid", transform=transform, answer=False)
+    train_dataset = VQADataset(df_path="./data/train.json", image_dir="./train", transform=transform)
+    test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./valid", transform=transform, answer=False)
     test_dataset.update_dict(train_dataset)
 
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True, pin_memory=True)
