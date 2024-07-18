@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torchvision
 from torchvision import transforms
+from transformers import BertTokenizer, BertModel
 
 
 def set_seed(seed):
@@ -75,6 +76,10 @@ class VQADataset(torch.utils.data.Dataset):
         self.idx2question = {}
         self.idx2answer = {}
 
+        # tokenizer
+        self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+        self.model = BertModel.from_pretrained('bert-base-uncased')
+
         # 質問文に含まれる単語を辞書に追加
         for question in self.df["question"]:
             question = process_text(question)
@@ -130,22 +135,20 @@ class VQADataset(torch.utils.data.Dataset):
         """
         image = Image.open(f"{self.image_dir}/{self.df['image'][idx]}")
         image = self.transform(image)
+        
         question = np.zeros(len(self.idx2question) + 1)  # 未知語用の要素を追加
-        question_words = self.df["question"][idx].split(" ")
-        for word in question_words:
-            try:
-                question[self.question2idx[word]] = 1  # one-hot表現に変換
-            except KeyError:
-                question[-1] = 1  # 未知語
+        inputs = self.tokenizer(self.df["question"][idx], return_tensors="pt")
+        outputs = self.model(**inputs)
+        question_embedding = outputs[1].detach().numpy()
 
         if self.answer:
             answers = [self.answer2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
             mode_answer_idx = mode(answers)  # 最頻値を取得（正解ラベル）
 
-            return image, torch.Tensor(question), torch.Tensor(answers), int(mode_answer_idx)
+            return image, torch.Tensor(question_embedding), torch.Tensor(answers), int(mode_answer_idx)
 
         else:
-            return image, torch.Tensor(question)
+            return image, torch.Tensor(question_embedding)
 
     def __len__(self):
         return len(self.df)
@@ -286,12 +289,195 @@ def ResNet18():
 def ResNet50():
     return ResNet(BottleneckBlock, [3, 4, 6, 3])
 
+# efficient net
+import math
+class Swish(nn.Module):  # Swish activation
+    def forward(self, x):
+        return x * torch.sigmoid(x)
+
+class SEblock(nn.Module): # Squeeze Excitation
+    def __init__(self, ch_in, ch_sq):
+        super().__init__()
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(ch_in, ch_sq, 1),
+            Swish(),
+            nn.Conv2d(ch_sq, ch_in, 1),
+        )
+        self.se.apply(weights_init)
+
+    def forward(self, x):
+        return x * torch.sigmoid(self.se(x))
+
+def weights_init(m):
+    if isinstance(m, nn.Conv2d):
+        nn.init.kaiming_normal_(m.weight)
+
+    if isinstance(m, nn.Linear):
+        nn.init.kaiming_uniform_(m.weight)
+        nn.init.zeros_(m.bias)
+
+class ConvBN(nn.Module):
+    def __init__(self, ch_in, ch_out, kernel_size,
+                 stride=1, padding=0, groups=1):
+        super().__init__()
+        self.layers = nn.Sequential(
+                nn.Conv2d(ch_in, ch_out, kernel_size,
+                          stride, padding, groups=groups, bias=False),
+                nn.BatchNorm2d(ch_out),
+        )
+        self.layers.apply(weights_init)
+
+    def forward(self, x):
+        return self.layers(x)
+
+class DropConnect(nn.Module):
+    def __init__(self, drop_rate):
+        super().__init__()
+        self.drop_rate = drop_rate
+
+    def forward(self, x):
+        if self.training:
+            keep_rate = 1.0 - self.drop_rate
+            r = torch.rand([x.size(0),1,1,1], dtype=x.dtype).to(x.device)
+            r += keep_rate
+            mask = r.floor()
+            return x.div(keep_rate) * mask
+        else:
+            return x
+
+class BMConvBlock(nn.Module):
+    def __init__(self, ch_in, ch_out,
+                 expand_ratio, stride, kernel_size,
+                 reduction_ratio=4, drop_connect_rate=0.2):
+        super().__init__()
+        self.use_residual = (ch_in==ch_out) & (stride==1)
+        ch_med = int(ch_in * expand_ratio)
+        ch_sq = max(1, ch_in//reduction_ratio)
+
+        # define network
+        if expand_ratio != 1.0:
+            layers = [ConvBN(ch_in, ch_med, 1),Swish()]
+        else:
+            layers = []
+
+        layers.extend([
+            ConvBN(ch_med, ch_med, kernel_size, stride=stride,
+                   padding=(kernel_size-1)//2, groups=ch_med), # depth-wise
+            Swish(),
+            SEblock(ch_med, ch_sq), # Squeeze Excitation
+            ConvBN(ch_med, ch_out, 1), # pixel-wise
+        ])
+
+        if self.use_residual:
+            self.drop_connect = DropConnect(drop_connect_rate)
+
+        self.layers = nn.Sequential(*layers)
+
+    def forward(self, x):
+        if self.use_residual:
+            return x + self.drop_connect(self.layers(x))
+        else:
+            return self.layers(x)
+
+class Flatten(nn.Module):
+    def forward(self, x):
+        return x.view(x.shape[0], -1)
+
+class EfficientNet(nn.Module):
+    def __init__(self, width_mult=1.0, depth_mult=1.0,
+                 resolution=False, dropout_rate=0.2,
+                 input_ch=3, num_classes=1000):
+        super().__init__()
+
+        # expand_ratio, channel, repeats, stride, kernel_size
+        settings = [
+            [1,  16, 1, 1, 3],  # MBConv1_3x3, SE, 112 -> 112
+            [6,  24, 2, 2, 3],  # MBConv6_3x3, SE, 112 ->  56
+            [6,  40, 2, 2, 5],  # MBConv6_5x5, SE,  56 ->  28
+            [6,  80, 3, 2, 3],  # MBConv6_3x3, SE,  28 ->  14
+            [6, 112, 3, 1, 5],  # MBConv6_5x5, SE,  14 ->  14
+            [6, 192, 4, 2, 5],  # MBConv6_5x5, SE,  14 ->   7
+            [6, 320, 1, 1, 3]   # MBConv6_3x3, SE,   7 ->   7]
+        ]
+
+        ch_out = int(math.ceil(32*width_mult))
+        features = [nn.AdaptiveAvgPool2d(resolution)] if resolution else []
+        features.extend([ConvBN(input_ch, ch_out, 3, stride=2), Swish()])
+
+        ch_in = ch_out
+        for t, c, n, s, k in settings:
+            ch_out  = int(math.ceil(c*width_mult))
+            repeats = int(math.ceil(n*depth_mult))
+            for i in range(repeats):
+                stride = s if i==0 else 1
+                features.extend([BMConvBlock(ch_in, ch_out, t, stride, k)])
+                ch_in = ch_out
+
+        ch_last = int(math.ceil(1280*width_mult))
+        features.extend([ConvBN(ch_in, ch_last, 1), Swish()])
+
+        self.features = nn.Sequential(*features)
+        self.classifier = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            Flatten(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(ch_last, num_classes),
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.classifier(x)
+        return x
+
+def _efficientnet(w_mult, d_mult, resolution, drop_rate,
+                  input_ch, num_classes=1000):
+    model = EfficientNet(w_mult, d_mult,
+                         resolution, drop_rate,
+                         input_ch, num_classes)
+    return model
+
+
+def efficientnet_b0(input_ch=3, num_classes=512):
+    #(w_mult, d_mult, resolution, droprate) = (1.0, 1.0, 224, 0.2)
+    return _efficientnet(1.0, 1.0, None, 0.2, input_ch, num_classes)
+
+def efficientnet_b1(input_ch=3, num_classes=512):
+    #(w_mult, d_mult, resolution, droprate) = (1.0, 1.1, 240, 0.2)
+    return _efficientnet(1.0, 1.1, None, 0.2, input_ch, num_classes)
+
+def efficientnet_b2(input_ch=3, num_classes=512):
+    #(w_mult, d_mult, resolution, droprate) = (1.1, 1.2, 260, 0.3)
+    return _efficientnet(1.1, 1.2, None, 0.3, input_ch, num_classes)
+
+def efficientnet_b3(input_ch=3, num_classes=512):
+    #(w_mult, d_mult, resolution, droprate) = (1.2, 1.4, 300, 0.3)
+    return _efficientnet(1.2, 1.4, None, 0.3, input_ch, num_classes)
+
+def efficientnet_b4(input_ch=3, num_classes=512):
+    #(w_mult, d_mult, resolution, droprate) = (1.4, 1.8, 380, 0.4)
+    return _efficientnet(1.4, 1.8, None, 0.4, input_ch, num_classes)
+
+def efficientnet_b5(input_ch=3, num_classes=512):
+    #(w_mult, d_mult, resolution, droprate) = (1.6, 2.2, 456, 0.4)
+    return _efficientnet(1.6, 2.2, None, 0.4, input_ch, num_classes)
+
+def efficientnet_b6(input_ch=3, num_classes=512):
+    #(w_mult, d_mult, resolution, droprate) = (1.8, 2.6, 528, 0.5)
+    return _efficientnet(1.8, 2.6, None, 0.5, input_ch, num_classes)
+
+def efficientnet_b7(input_ch=3, num_classes=512):
+    #(w_mult, d_mult, resolution, droprate) = (2.0, 3.1, 600, 0.5)
+    return _efficientnet(2.0, 3.1, None, 0.5, input_ch, num_classes)
+
 
 class VQAModel(nn.Module):
     def __init__(self, vocab_size: int, n_answer: int):
         super().__init__()
-        self.resnet = ResNet18()
-        self.text_encoder = nn.Linear(vocab_size, 512)
+        # self.resnet = ResNet18()
+        self.efficientnet = efficientnet_b0()
+        self.vocab_size = 768
+        self.text_encoder = nn.Linear(self.vocab_size, 512)
 
         self.fc = nn.Sequential(
             nn.Linear(1024, 512),
@@ -300,10 +486,12 @@ class VQAModel(nn.Module):
         )
 
     def forward(self, image, question):
-        image_feature = self.resnet(image)  # 画像の特徴量
+        image_feature = self.efficientnet(image)  # 画像の特徴量
         question_feature = self.text_encoder(question)  # テキストの特徴量
 
-        x = torch.cat([image_feature, question_feature], dim=1)
+        # print(image_feature.shape, question_feature.squeeze(1).shape)
+
+        x = torch.cat([image_feature, question_feature.squeeze(1)], dim=1)
         x = self.fc(x)
 
         return x
@@ -320,7 +508,7 @@ def train(model, dataloader, optimizer, criterion, device):
     start = time.time()
     for image, question, answers, mode_answer in dataloader:
         image, question, answer, mode_answer = \
-            image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
+            image.to(device, non_blocking=True), question.to(device, non_blocking=True), answers.to(device, non_blocking=True), mode_answer.to(device, non_blocking=True)
 
         pred = model(image, question)
         loss = criterion(pred, mode_answer.squeeze())
@@ -346,7 +534,7 @@ def eval(model, dataloader, optimizer, criterion, device):
     start = time.time()
     for image, question, answers, mode_answer in dataloader:
         image, question, answer, mode_answer = \
-            image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
+            image.to(device, non_blocking=True), question.to(device, non_blocking=True), answers.to(device, non_blocking=True), mode_answer.to(device, non_blocking=True)
 
         pred = model(image, question)
         loss = criterion(pred, mode_answer.squeeze())
@@ -365,22 +553,29 @@ def main():
 
     # dataloader / model
     transform = transforms.Compose([
+        transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
+        # transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5),
+        # transforms.RandomHorizontalFlip(p=1.0),
+        # transforms.RandomRotation(degrees=(-180, 180)),
+
         transforms.Resize((224, 224)),
-        transforms.ToTensor()
+        transforms.ToTensor(),
+        # transforms.RandomErasing(p=0.8, scale=(0.02, 0.33), ratio=(0.3, 3.3)),
+
     ])
-    train_dataset = VQADataset(df_path="./data/train.json", image_dir="/content/data/train", transform=transform)
-    test_dataset = VQADataset(df_path="./data/valid.json", image_dir="/content/data/valid", transform=transform, answer=False)
+    train_dataset = VQADataset(df_path="/content/data/train.json", image_dir="/content/data/train", transform=transform)
+    test_dataset = VQADataset(df_path="/content/data/valid.json", image_dir="/content/data/valid", transform=transform, answer=False)
     test_dataset.update_dict(train_dataset)
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True, pin_memory=True)
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, pin_memory=True)
 
     model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, n_answer=len(train_dataset.answer2idx)).to(device)
 
     # optimizer / criterion
-    num_epoch = 5
+    num_epoch = 1
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001, weight_decay=1e-5)
 
     # train model
     for epoch in range(num_epoch):
@@ -395,7 +590,7 @@ def main():
     model.eval()
     submission = []
     for image, question in test_loader:
-        image, question = image.to(device), question.to(device)
+        image, question = image.to(device, non_blocking=True), question.to(device, non_blocking=True)
         pred = model(image, question)
         pred = pred.argmax(1).cpu().item()
         submission.append(pred)
